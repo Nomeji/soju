@@ -272,6 +272,15 @@ func (u *user) getNetwork(name string) *network {
 	return nil
 }
 
+func (u *user) getNetworkByID(id int64) *network {
+	for _, net := range u.networks {
+		if net.ID == id {
+			return net
+		}
+	}
+	return nil
+}
+
 func (u *user) run() {
 	networks, err := u.srv.db.ListNetworks(u.Username)
 	if err != nil {
@@ -333,7 +342,14 @@ func (u *user) run() {
 		case eventUpstreamConnectionError:
 			net := e.net
 
-			if net.lastError == nil || net.lastError.Error() != e.err.Error() {
+			stopped := false
+			select {
+			case <-net.stopped:
+				stopped = true
+			default:
+			}
+
+			if !stopped && (net.lastError == nil || net.lastError.Error() != e.err.Error()) {
 				net.forEachDownstream(func(dc *downstreamConn) {
 					sendServiceNOTICE(dc, fmt.Sprintf("failed connecting/registering to %s: %v", net.GetName(), e.err))
 				})
@@ -425,45 +441,93 @@ func (u *user) run() {
 	}
 }
 
-func (u *user) createNetwork(net *Network) (*network, error) {
-	if net.ID != 0 {
+func (u *user) addNetwork(network *network) {
+	u.networks = append(u.networks, network)
+	go network.run()
+}
+
+func (u *user) removeNetwork(network *network) {
+	network.stop()
+
+	u.forEachDownstream(func(dc *downstreamConn) {
+		if dc.network != nil && dc.network == network {
+			dc.Close()
+		}
+	})
+
+	for i, net := range u.networks {
+		if net == network {
+			u.networks = append(u.networks[:i], u.networks[i+1:]...)
+			return
+		}
+	}
+
+	panic("tried to remove a non-existing network")
+}
+
+func (u *user) createNetwork(record *Network) (*network, error) {
+	if record.ID != 0 {
 		panic("tried creating an already-existing network")
 	}
 
-	network := newNetwork(u, net, nil)
+	network := newNetwork(u, record, nil)
 	err := u.srv.db.StoreNetwork(u.Username, &network.Network)
 	if err != nil {
 		return nil, err
 	}
 
-	u.networks = append(u.networks, network)
+	u.addNetwork(network)
 
-	go network.run()
 	return network, nil
 }
 
-func (u *user) deleteNetwork(id int64) error {
-	for i, net := range u.networks {
-		if net.ID != id {
-			continue
-		}
-
-		if err := u.srv.db.DeleteNetwork(net.ID); err != nil {
-			return err
-		}
-
-		u.forEachDownstream(func(dc *downstreamConn) {
-			if dc.network != nil && dc.network == net {
-				dc.Close()
-			}
-		})
-
-		net.stop()
-		u.networks = append(u.networks[:i], u.networks[i+1:]...)
-		return nil
+func (u *user) updateNetwork(record *Network) (*network, error) {
+	if record.ID == 0 {
+		panic("tried updating a new network")
 	}
 
-	panic("tried deleting a non-existing network")
+	network := u.getNetworkByID(record.ID)
+	if network == nil {
+		panic("tried updating a non-existing network")
+	}
+
+	if err := u.srv.db.StoreNetwork(u.Username, record); err != nil {
+		return nil, err
+	}
+
+	channels := make([]Channel, 0, len(network.channels))
+	for _, ch := range network.channels {
+		channels = append(channels, *ch)
+	}
+
+	// TODO: need to wait for the previous connection to be closed otherwise
+	// we can't register (duplicate nick)
+	updatedNetwork := newNetwork(u, record, channels)
+
+	u.forEachDownstream(func(dc *downstreamConn) {
+		if dc.network != nil && dc.network == network {
+			dc.network = updatedNetwork
+		}
+	})
+
+	u.removeNetwork(network)
+	u.addNetwork(updatedNetwork)
+
+	return updatedNetwork, nil
+}
+
+func (u *user) deleteNetwork(id int64) error {
+	network := u.getNetworkByID(id)
+	if network == nil {
+		panic("tried deleting a non-existing network")
+	}
+
+	if err := u.srv.db.DeleteNetwork(network.ID); err != nil {
+		return err
+	}
+
+	u.removeNetwork(network)
+	return nil
 }
 
 func (u *user) updatePassword(hashed string) error {
